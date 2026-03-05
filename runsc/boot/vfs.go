@@ -360,6 +360,8 @@ func (f *fdDispenser) empty() bool {
 }
 
 type containerMounter struct {
+	l *Loader
+
 	root *specs.Root
 
 	// mounts is the set of submounts for the container. It's a copy from the spec
@@ -388,6 +390,9 @@ type containerMounter struct {
 
 	// sharedMounts is a map of shared mounts that can be reused across
 	// containers.
+	//
+	// FIXME: This is equivalent to l.sharedMounts, but lacks the checklocks
+	// annotation.
 	sharedMounts map[string]*vfs.Mount
 
 	// productName is the value to show in
@@ -411,18 +416,20 @@ type containerMounter struct {
 	rootfsUpperTarFD *fd.FD
 }
 
-func newContainerMounter(info *containerInfo, k *kernel.Kernel, hints *PodMountHints, sharedMounts map[string]*vfs.Mount, productName string, sandboxID string) *containerMounter {
+// +checklocks:l.mu
+func (l *Loader) newContainerMounter(info *containerInfo, sandboxID string) *containerMounter {
 	return &containerMounter{
+		l:                 l,
 		root:              info.spec.Root,
 		mounts:            compileMounts(info.spec, info.conf, info.procArgs.ContainerID),
 		goferFDs:          fdDispenser{fds: info.goferFDs},
 		goferFilestoreFDs: fdDispenser{fds: info.goferFilestoreFDs},
 		devGoferFD:        info.devGoferFD,
 		goferMountConfs:   info.goferMountConfs,
-		k:                 k,
-		hints:             hints,
-		sharedMounts:      sharedMounts,
-		productName:       productName,
+		k:                 l.k,
+		hints:             l.mountHints,
+		sharedMounts:      l.sharedMounts,
+		productName:       l.productName,
 		containerID:       info.cid,
 		sandboxID:         sandboxID,
 		containerName:     info.containerName,
@@ -647,16 +654,27 @@ func (c *containerMounter) configureOverlay(ctx context.Context, conf *config.Co
 	}
 	if filestoreFD != nil {
 		// Create memory file for disk-backed overlays.
-		mf, err := createPrivateMemoryFile(filestoreFD.ReleaseToFile("overlay-filestore"), vfs.RestoreID{ContainerName: c.containerName, Path: dst})
+		restoreID := vfs.RestoreID{ContainerName: c.containerName, Path: dst}
+		mf, err := createPrivateMemoryFile(filestoreFD.ReleaseToFile("overlay-filestore"), restoreID, c.l.fsRestore)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to create memory file for overlay: %v", err)
 		}
 		tmpfsOpts.MemoryFile = mf
+		sourceTar, err := c.l.fsRestore.releaseTmpfsSourceTar(restoreID)
+		if err != nil {
+			mf.Destroy()
+			return nil, nil, fmt.Errorf("failed to get tar archive from filesystem checkpoint: %w", err)
+		}
+		if sourceTar != nil {
+			log.Infof("Loading filesystem checkpoint tree for %q", restoreID)
+			tmpfsOpts.SourceTar = sourceTar
+			tmpfsOpts.SourceTarFSCheckpoint = true
+		}
 	}
 	// If the rootfs upper tar file is provided, it will be applied to the
 	// tmpfs which is on the upper layer of the root's overlay fs.
 	if rootfsUpperTarFD != nil {
-		tmpfsOpts.SourceTarFile = rootfsUpperTarFD.ReleaseToFile("rootfs-upper-tar-fd")
+		tmpfsOpts.SourceTar = rootfsUpperTarFD.ReleaseToFile("rootfs-upper-tar-fd")
 	}
 	upperOpts.GetFilesystemOptions.InternalData = tmpfsOpts
 	upper, err := c.k.VFS().MountDisconnected(ctx, creds, "" /* source */, tmpfs.Name, &upperOpts)
@@ -854,7 +872,7 @@ func (c *containerMounter) getPathMode(ctx context.Context, creds *auth.Credenti
 }
 
 func (c *containerMounter) mountSubmount(ctx context.Context, spec *specs.Spec, conf *config.Config, mns *vfs.MountNamespace, creds *auth.Credentials, submount *mountInfo) (*vfs.Mount, error) {
-	fsName, opts, err := getMountNameAndOptions(spec, conf, submount, c.productName, c.containerName)
+	fsName, opts, err := getMountNameAndOptions(spec, conf, submount, c.productName, c.containerName, c.l.fsRestore)
 	if err != nil {
 		return nil, fmt.Errorf("mountOptions failed: %w", err)
 	}
@@ -917,7 +935,7 @@ func (c *containerMounter) mountSubmount(ctx context.Context, spec *specs.Spec, 
 
 // getMountNameAndOptions retrieves the fsName, opts, and useOverlay values
 // used for mounts.
-func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo, productName, containerName string) (string, *vfs.MountOptions, error) {
+func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo, productName, containerName string, fsr *fsRestore) (string, *vfs.MountOptions, error) {
 	fsName := m.mount.Type
 	var (
 		mopts        = m.mount.Options
@@ -950,16 +968,27 @@ func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo,
 			return "", nil, err
 		}
 		if m.filestoreFD != nil {
-			mf, err := createPrivateMemoryFile(m.filestoreFD.ReleaseToFile("tmpfs-filestore"), vfs.RestoreID{ContainerName: containerName, Path: m.mount.Destination})
+			restoreID := vfs.RestoreID{ContainerName: containerName, Path: m.mount.Destination}
+			mf, err := createPrivateMemoryFile(m.filestoreFD.ReleaseToFile("tmpfs-filestore"), restoreID, fsr)
 			if err != nil {
-				return "", nil, fmt.Errorf("failed to create memory file for tmpfs: %v", err)
+				return "", nil, fmt.Errorf("failed to create memory file for tmpfs: %w", err)
 			}
-			internalData = tmpfs.FilesystemOpts{
+			tmpfsOpts := tmpfs.FilesystemOpts{
 				MemoryFile: mf,
 				// If a mount is being overlaid with tmpfs, it should not be limited by
 				// the default tmpfs size limit.
 				DisableDefaultSizeLimit: true,
 			}
+			sourceTar, err := fsr.releaseTmpfsSourceTar(restoreID)
+			if err != nil {
+				return "", nil, fmt.Errorf("failed to get tar archive from filesystem checkpoint: %w", err)
+			}
+			if sourceTar != nil {
+				log.Infof("Loading filesystem checkpoint tree for %q", restoreID)
+				tmpfsOpts.SourceTar = sourceTar
+				tmpfsOpts.SourceTarFSCheckpoint = true
+			}
+			internalData = tmpfsOpts
 		}
 
 	case Bind:
@@ -1052,7 +1081,11 @@ func parseKeyValue(s string) (string, string, bool) {
 	return strings.TrimSpace(tokens[0]), strings.TrimSpace(tokens[1]), true
 }
 
-func createPrivateMemoryFile(file *os.File, restoreID vfs.RestoreID) (*pgalloc.MemoryFile, error) {
+func createPrivateMemoryFile(file *os.File, restoreID vfs.RestoreID, fsr *fsRestore) (*pgalloc.MemoryFile, error) {
+	pagesMetadataReader, pagesFileOffset, err := fsr.releaseMemoryFile(restoreID)
+	if err != nil {
+		return nil, err
+	}
 	mfOpts := pgalloc.MemoryFileOpts{
 		// Private memory files are usually backed by files on disk. Ideally we
 		// would confirm with fstatfs(2) but that is prohibited by seccomp.
@@ -1066,7 +1099,22 @@ func createPrivateMemoryFile(file *os.File, restoreID vfs.RestoreID) (*pgalloc.M
 		// Private memory files need to be restored correctly using this ID.
 		RestoreID: restoreID.String(),
 	}
-	return pgalloc.NewMemoryFile(file, mfOpts)
+	mf, err := pgalloc.NewMemoryFile(file, mfOpts)
+	if err != nil {
+		return mf, err
+	}
+	if pagesMetadataReader != nil {
+		log.Infof("Loading filesystem checkpoint data for %q", restoreID)
+		if err := mf.LoadFrom(context.Background(), pagesMetadataReader, &pgalloc.LoadOpts{
+			PagesFile:       fsr.apfl,
+			PagesFileOffset: pagesFileOffset,
+		}); err != nil {
+			mf.Destroy()
+			return nil, err
+		}
+		fsr.afterMemoryFileLoadFrom()
+	}
+	return mf, nil
 }
 
 // mountTmp mounts an internal tmpfs at '/tmp' if it's safe to do so.
@@ -1270,7 +1318,7 @@ func (c *containerMounter) mountSharedMaster(ctx context.Context, spec *specs.Sp
 	// Mount the master using the options from the hint (mount annotations).
 	origOpts := mntInfo.mount.Options
 	mntInfo.mount.Options = mntInfo.hint.Mount.Options
-	fsName, opts, err := getMountNameAndOptions(spec, conf, mntInfo, c.productName, c.containerName)
+	fsName, opts, err := getMountNameAndOptions(spec, conf, mntInfo, c.productName, c.containerName, c.l.fsRestore)
 	mntInfo.mount.Options = origOpts
 	if err != nil {
 		return nil, err
@@ -1399,7 +1447,7 @@ func (c *containerMounter) configureRestore(fdmap map[vfs.RestoreID]int, mfmap m
 	fdmap[rootKey] = c.goferFDs.remove()
 
 	if rootfsConf := c.goferMountConfs[0]; rootfsConf.IsFilestorePresent() {
-		mf, err := createPrivateMemoryFile(c.goferFilestoreFDs.removeAsFD().ReleaseToFile("overlay-filestore"), rootKey)
+		mf, err := createPrivateMemoryFile(c.goferFilestoreFDs.removeAsFD().ReleaseToFile("overlay-filestore"), rootKey, nil)
 		if err != nil {
 			return fmt.Errorf("failed to create private memory file for mount rootfs: %w", err)
 		}
@@ -1418,7 +1466,7 @@ func (c *containerMounter) configureRestore(fdmap map[vfs.RestoreID]int, mfmap m
 		}
 		if submount.filestoreFD != nil {
 			key := vfs.RestoreID{ContainerName: c.containerName, Path: submount.mount.Destination}
-			mf, err := createPrivateMemoryFile(submount.filestoreFD.ReleaseToFile("overlay-filestore"), key)
+			mf, err := createPrivateMemoryFile(submount.filestoreFD.ReleaseToFile("overlay-filestore"), key, nil)
 			if err != nil {
 				return fmt.Errorf("failed to create private memory file for mount %q: %w", submount.mount.Destination, err)
 			}

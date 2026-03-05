@@ -85,6 +85,7 @@ go_library(
         "directory.go",
         "filesystem.go",
         "filesystem_mutex.go",
+        "fscheckpoint.go",
         "fstree.go",
         "inode_mutex.go",
         "inode_refs.go",
@@ -98,6 +99,7 @@ go_library(
         "tar.go",
         "tmpfs.go",
     ],
+    marshal = True,
     visibility = ["//pkg/sentry:internal"],
     deps = [
         "//pkg/abi/linux",
@@ -109,6 +111,7 @@ go_library(
         "//pkg/fsutil",
         "//pkg/hostarch",
         "//pkg/log",
+        "//pkg/marshal",
         "//pkg/refs",
         "//pkg/safemem",
         "//pkg/sentry/arch",
