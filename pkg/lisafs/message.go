@@ -176,6 +176,9 @@ const (
 	// ConnectWithCreds is analogous to connect(2) but it asks the server
 	// to connect with the provided effective uid/gid.
 	ConnectWithCreds MID = 32
+
+	// RenameAt2 is loosely analogous to renameat2(2).
+	RenameAt2 MID = 33
 )
 
 const (
@@ -1493,35 +1496,37 @@ func (*UnlinkAtResp) String() string {
 	return "UnlinkAtResp{}"
 }
 
-// RenameAtReq is used to make RenameAt requests. Note that the request takes in
+// RenameAt2Req is used to make RenameAt2 requests. Note that the request takes in
 // the to-be-renamed file's FD instead of oldDir and oldName like renameat(2).
-type RenameAtReq struct {
+type RenameAt2Req struct {
 	OldDir  FDID
 	NewDir  FDID
 	OldName SizedString
 	NewName SizedString
+	Flags   primitive.Uint32
 }
 
 // String implements fmt.Stringer.String.
-func (r *RenameAtReq) String() string {
-	return fmt.Sprintf("RenameAtReq{OldDir: %d, NewDir: %d, OldName: %s, NewName: %s}", r.OldDir, r.NewDir, r.OldName, r.NewName)
+func (r *RenameAt2Req) String() string {
+	return fmt.Sprintf("RenameAt2Req{OldDir: %d, NewDir: %d, OldName: %s, NewName: %s, Flags: %#x}", r.OldDir, r.NewDir, r.OldName, r.NewName, r.Flags)
 }
 
 // SizeBytes implements marshal.Marshallable.SizeBytes.
-func (r *RenameAtReq) SizeBytes() int {
-	return r.OldDir.SizeBytes() + r.NewDir.SizeBytes() + r.OldName.SizeBytes() + r.NewName.SizeBytes()
+func (r *RenameAt2Req) SizeBytes() int {
+	return r.OldDir.SizeBytes() + r.NewDir.SizeBytes() + r.OldName.SizeBytes() + r.NewName.SizeBytes() + r.Flags.SizeBytes()
 }
 
 // MarshalBytes implements marshal.Marshallable.MarshalBytes.
-func (r *RenameAtReq) MarshalBytes(dst []byte) []byte {
+func (r *RenameAt2Req) MarshalBytes(dst []byte) []byte {
 	dst = r.OldDir.MarshalUnsafe(dst)
 	dst = r.NewDir.MarshalUnsafe(dst)
 	dst = r.OldName.MarshalBytes(dst)
-	return r.NewName.MarshalBytes(dst)
+	dst = r.NewName.MarshalBytes(dst)
+	return r.Flags.MarshalBytes(dst)
 }
 
 // CheckedUnmarshal implements marshal.CheckedMarshallable.CheckedUnmarshal.
-func (r *RenameAtReq) CheckedUnmarshal(src []byte) ([]byte, bool) {
+func (r *RenameAt2Req) CheckedUnmarshal(src []byte) ([]byte, bool) {
 	r.OldName = ""
 	r.NewName = ""
 	if r.SizeBytes() > len(src) {
@@ -1536,10 +1541,11 @@ func (r *RenameAtReq) CheckedUnmarshal(src []byte) ([]byte, bool) {
 	if srcRemain, ok = r.NewName.CheckedUnmarshal(srcRemain); !ok {
 		return src, false
 	}
+	srcRemain = r.Flags.UnmarshalUnsafe(srcRemain)
 	return srcRemain, true
 }
 
-// RenameAtResp is an empty response to RenameAtReq.
+// RenameAtResp is an empty response to RenameAtReq and RenameAt2Req.
 type RenameAtResp struct{ EmptyMessage }
 
 // String implements fmt.Stringer.String.

@@ -81,6 +81,7 @@ var handlers = [...]RPCHandler{
 	Listen:           ListenHandler,
 	Accept:           AcceptHandler,
 	ConnectWithCreds: ConnectWithCredsHandler,
+	RenameAt2:        RenameAtHandler,
 }
 
 // ErrorHandler handles Error message.
@@ -1271,7 +1272,7 @@ func RenameAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint3
 	if c.readonly {
 		return 0, unix.EROFS
 	}
-	var req RenameAtReq
+	var req RenameAt2Req
 	if _, ok := req.CheckedUnmarshal(comm.PayloadBuf(payloadLen)); !ok {
 		return 0, unix.EIO
 	}
@@ -1299,6 +1300,7 @@ func RenameAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint3
 	if !oldDir.IsDir() || !newDir.IsDir() {
 		return 0, unix.ENOTDIR
 	}
+	flags := uint32(req.Flags)
 
 	// Hold RenameMu for writing during rename, this is important.
 	return 0, oldDir.safelyGlobal(func() error {
@@ -1312,8 +1314,17 @@ func RenameAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint3
 		}
 
 		// Attempt the actual rename.
-		if err := oldDir.impl.RenameAt(oldName, newDir.impl, newName); err != nil {
-			return err
+		// RenameAt can be replaced by RenameAt2 with flags == 0. The check here
+		// is for backward compatibility.
+		if flags == 0 {
+			if err := oldDir.impl.RenameAt(oldName, newDir.impl, newName); err != nil {
+				return err
+			}
+		} else {
+			// Attempt the exchange.
+			if err := oldDir.impl.RenameAt2(oldName, newDir.impl, newName, flags); err != nil {
+				return err
+			}
 		}
 
 		// Successful, so update the node tree. Note that since we have global
@@ -1325,10 +1336,24 @@ func RenameAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint3
 		newDir.node.childrenMu.Lock()
 		replaced := newDir.node.removeChildLocked(newName)
 		newDir.node.childrenMu.Unlock()
-		if replaced != nil {
+		switch {
+		case replaced == nil && flags&linux.RENAME_EXCHANGE != 0:
+			// RENAME_EXCHANGE requires that the target file exist.
+			return unix.ENOENT
+		case replaced != nil && flags&linux.RENAME_EXCHANGE == 0:
 			replaced.opMu.Lock()
 			replaced.markDeletedRecursive()
 			replaced.opMu.Unlock()
+		case replaced != nil && flags&linux.RENAME_EXCHANGE != 0:
+			// Move the replaced node to the right position.
+			replaced.parent.DecRef(nil)
+			replaced.parent = oldDir.node
+			replaced.parent.IncRef()
+			replaced.name = oldName
+			oldDir.node.childrenMu.Lock()
+			oldDir.node.insertChildLocked(oldName, replaced)
+			oldDir.node.childrenMu.Unlock()
+			notifyRenameRecursive(replaced)
 		}
 
 		// Now move the renamed node to the right position.
