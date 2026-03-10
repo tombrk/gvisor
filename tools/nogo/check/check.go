@@ -752,7 +752,11 @@ func FindRoots(srcs []string, srcRootRegex string) ([]string, error) {
 }
 
 // SplitPackages splits a typical package structure into packages.
-func SplitPackages(srcs []string, srcRootPrefix string) map[string][]string {
+func SplitPackages(srcs []string, srcRootPrefix string) (map[string][]string, error) {
+	return splitPackages(srcs, srcRootPrefix)
+}
+
+var splitPackages = func(srcs []string, srcRootPrefix string) (map[string][]string, error) {
 	sources := make(map[string][]string)
 	for _, filename := range srcs {
 		if !strings.HasPrefix(filename, srcRootPrefix) {
@@ -802,7 +806,7 @@ func SplitPackages(srcs []string, srcRootPrefix string) map[string][]string {
 		sources[pkg] = append(sources[pkg], filename)
 	}
 
-	return sources
+	return sources, nil
 }
 
 // Bundle checks a bundle of files (typically the standard library).
