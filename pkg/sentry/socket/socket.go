@@ -331,6 +331,11 @@ func RegisterProvider(family int, provider Provider) {
 	families[family] = append(families[family], provider)
 }
 
+// Families returns the full families map.
+func Families() map[int][]Provider {
+	return families
+}
+
 // New creates a new socket with the given family, type and protocol.
 func New(t *kernel.Task, family int, stype linux.SockType, protocol int) (*vfs.FileDescription, *syserr.Error) {
 	for _, p := range families[family] {

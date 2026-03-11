@@ -416,6 +416,10 @@ type commonEndpoint interface {
 // sock encapsulates all the state needed to represent a network stack
 // endpoint in the kernel context.
 //
+// Sock is an exported alias for sock, allowing external packages to
+// type-assert and access exported fields (e.g. Endpoint).
+type Sock = sock
+
 // +stateify savable
 type sock struct {
 	vfsfd vfs.FileDescription
